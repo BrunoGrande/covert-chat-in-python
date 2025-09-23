@@ -1,0 +1,7 @@
+captures/
+*.pcap
+*.pcapng
+__pycache__/
+*.pyc
+.env
+

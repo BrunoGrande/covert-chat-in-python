@@ -1,0 +1,36 @@
+services:
+  peera:
+    build: .
+    image: icmp_covert_chat:peera
+    container_name: icmp_peera
+    cap_add: [NET_RAW]
+    stdin_open: true   # like: -i
+    tty: true          # like: -t
+    restart: unless-stopped
+    command: ["--peer", "peerb", "--verbose"]
+    networks:
+      covert_net:
+        aliases: [peera]
+    volumes:
+      - ./captures:/captures
+    user: "0:0"
+
+  peerb:
+    build: .
+    image: icmp_covert_chat:peerb
+    container_name: icmp_peerb
+    cap_add: [NET_RAW]
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    command: ["--peer", "peera", "--verbose"]
+    networks:
+      covert_net:
+        aliases: [peerb]
+    volumes:
+      - ./captures:/captures
+    user: "0:0"
+
+networks:
+  covert_net:
+    driver: bridge
