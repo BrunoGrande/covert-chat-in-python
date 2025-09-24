@@ -12,12 +12,27 @@ Assumptions (valid on Docker bridge):
 import argparse, os, random, select, socket, struct, sys, threading, time
 from typing import Optional, Tuple
 
-# ---- constants ----
-ICMP_ECHO_REPLY, ICMP_CODE = 0, 0
-CTRL_START, CTRL_MID, CTRL_IDLE, CTRL_END = 0, 1, 2, 3
-MAGIC, MAX_SEQ = 0xB7, 64
-SEND_INTERVAL, HANDSHAKE_INTERVAL, RECV_TIMEOUT = 0.08, 0.5, 0.2
-PAD_LEN = 14
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ICMP_ECHO_REPLY: int = 0  # Type 0
+ICMP_CODE: int = 0
+
+CTRL_START: int = 0b00
+CTRL_MID:   int = 0b01
+CTRL_IDLE:  int = 0b10  # reserved (optional keepalive)
+CTRL_END:   int = 0b11
+
+MAGIC: int = 0xB7
+MAX_SEQ: int = 64
+
+SEND_INTERVAL: float = 0.08       # spacing between data packets
+HANDSHAKE_INTERVAL: float = 0.50  # spacing during handshake
+RECV_TIMEOUT: float = 0.20        # socket receive timeout (seconds)
+
+PAD_LEN: int = 14  # extra payload size to look less uniform
+
 
 # ---- stego header: [2b ctrl | 6b seq | 8b data] ----
 def pack_header(ctrl: int, seq: int, data: int) -> bytes:
