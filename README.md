@@ -106,6 +106,18 @@ This gives minimal framing so we can mark **start**, **data**, and **end**.
 
 ## Stop everything
 ```bash
+# build + start
+docker compose up --build -d
+
+# attach (two terminals)
+docker attach icmp_peera
+docker attach icmp_peerb
+
+# capture pcaps (optional)
+docker exec -it icmp_peera tcpdump -i any -w /captures/peerA.pcap icmp
+docker exec -it icmp_peerb tcpdump -i any -w /captures/peerB.pcap icmp
+
+# stop
 docker compose down
 ```
 (Use `-v` to remove bind volume contents, if you created any.)
