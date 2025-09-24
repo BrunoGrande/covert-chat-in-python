@@ -53,7 +53,7 @@ You should see something like:
 
 ---
 
-## Capture PCAPs (for the report)
+## Capture PCAPs (for report)
 Start the capture **before** you type, and capture on **eth0** inside the container:
 
 ```bash
@@ -72,7 +72,7 @@ Press **Ctrl-C** to stop. The files will appear on the host in `./captures/`.
 
 ---
 
-## How the code works (short & sweet)
+## How the code works (in short)
 
 ### 1) ICMP builder + checksum
 We construct an **Echo Reply** header and compute the ICMP checksum over `header + payload`. The IP header is handled by the raw socket.
