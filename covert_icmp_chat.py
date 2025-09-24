@@ -1,320 +1,201 @@
 #!/usr/bin/env python3
-import argparse
-import os
-import random
-import select
-import socket
-import struct
-import sys
-import threading
-import sys
-import time
+"""
+Covert ICMP Chat (Type 0 Echo Reply) —  for Docker with static IPs.
+- 2-byte stego header at payload start: [2 bits ctrl | 6 bits seq | 8 bits data]
+- Handshake: START+MAGIC (0xB7) then START+NONCE (1B). Higher nonce -> master.
+- Data: stdin bytes sent as MID frames; END on EOF/Ctrl-C.
+Assumptions (valid on Docker bridge):
+- Peer is passed as a literal IPv4 (10.0.0.10/11). No DNS retries.
+- IPv4 header has no options => IHL = 20 bytes.
+"""
+
+import argparse, os, random, select, socket, struct, sys, threading, time
 from typing import Optional, Tuple
 
-# ---------- Protocol constants ----------
-ICMP_ECHO_REPLY = 0  # Type 0
-ICMP_CODE = 0
-CTRL_START = 0b00
-CTRL_MID   = 0b01
-CTRL_IDLE  = 0b10  # reserved/unused here
-CTRL_END   = 0b11
+# ---- constants ----
+ICMP_ECHO_REPLY, ICMP_CODE = 0, 0
+CTRL_START, CTRL_MID, CTRL_IDLE, CTRL_END = 0, 1, 2, 3
+MAGIC, MAX_SEQ = 0xB7, 64
+SEND_INTERVAL, HANDSHAKE_INTERVAL, RECV_TIMEOUT = 0.08, 0.5, 0.2
+PAD_LEN = 14
 
-MAGIC_BYTE = 0xB7  # first START data byte to help sync/detect
-SEND_INTERVAL = 0.08  # seconds between packets when streaming bytes
-HANDSHAKE_INTERVAL = 0.5
-RECV_TIMEOUT = 0.2
-PADDING_LEN = 14  # extra bytes after the 2-byte header to look more "normal"
-MAX_SEQ = 64
+# ---- stego header: [2b ctrl | 6b seq | 8b data] ----
+def pack_header(ctrl: int, seq: int, data: int) -> bytes:
+    return bytes([((ctrl & 3) << 6) | (seq & 63), data & 0xFF])
 
-# ---------- Stego packing/unpacking ----------
-def stego_pack(ctrl: int, seq: int, data_byte: int) -> bytes:
-    """Pack [2 bits ctrl | 6 bits seq | 8 bits data] into 2 bytes."""
-    ctrl &= 0b11
-    seq &= 0b111111
-    data_byte &= 0xFF
-    first = (ctrl << 6) | seq
-    return bytes([first, data_byte])
+def unpack_header(b: bytes) -> Tuple[int,int,int]:
+    x = b[0]
+    return (x >> 6) & 3, x & 63, b[1]
 
-def stego_unpack(b: bytes) -> Tuple[int, int, int]:
-    """Unpack the first 2 bytes into (ctrl, seq, data_byte)."""
-    if len(b) < 2:
-        raise ValueError("Payload too short")
-    first, data_byte = b[0], b[1]
-    ctrl = (first >> 6) & 0b11
-    seq = first & 0b111111
-    return ctrl, seq, data_byte
-
-# ---------- Checksums ----------
+# ---- checksum + icmp builder ----
 def icmp_checksum(data: bytes) -> int:
-    """Compute ICMP checksum."""
-    if len(data) % 2:
+    if len(data) & 1:
         data += b"\x00"
     s = 0
     for i in range(0, len(data), 2):
-        word = data[i] << 8 | data[i+1]
-        s += word
-        s = (s & 0xFFFF) + (s >> 16)
-    return ~s & 0xFFFF
+        s += int.from_bytes(data[i:i+2], "big")
+    s = (s & 0xFFFF) + (s >> 16)
+    s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
 
-# ---------- Packet builders ----------
 def build_icmp_echo_reply(identifier: int, sequence: int, payload: bytes) -> bytes:
-    """Build ICMP Echo Reply packet (without IP header)."""
-    header = struct.pack("!BBHHH", ICMP_ECHO_REPLY, ICMP_CODE, 0, identifier, sequence)
-    chk = icmp_checksum(header + payload)
-    header = struct.pack("!BBHHH", ICMP_ECHO_REPLY, ICMP_CODE, chk, identifier, sequence)
-    return header + payload
+    hdr = struct.pack("!BBHHH", ICMP_ECHO_REPLY, ICMP_CODE, 0, identifier, sequence)
+    chk = icmp_checksum(hdr + payload)
+    return struct.pack("!BBHHH", ICMP_ECHO_REPLY, ICMP_CODE, chk, identifier, sequence) + payload
 
 def build_payload(ctrl: int, seq: int, data_byte: int) -> bytes:
-    stego = stego_pack(ctrl, seq, data_byte)
-    # Add benign-looking padding (timestamps, pid, jitter)
-    pad = struct.pack("!I", int(time.time())) + struct.pack("!H", os.getpid() & 0xFFFF)
-    # Ensure fixed-ish size, top up with random bytes to PADDING_LEN
-    rnd = os.urandom(max(0, PADDING_LEN - len(pad)))
-    return stego + pad + rnd
+    stego = pack_header(ctrl, seq, data_byte)
+    pad = struct.pack("!IH", int(time.time()), os.getpid() & 0xFFFF)
+    return stego + pad + os.urandom(max(0, PAD_LEN - len(pad)))
 
-WINDOWS = sys.platform.startswith('win')
-
-# ---------- Receiver (raw ICMP sniffer) ----------
-def parse_ip_header(pkt: bytes) -> Tuple[int, int, str, str, int]:
-    """Return (ihl_bytes, proto, src_ip, dst_ip, total_len)."""
-    if len(pkt) < 20:  # min IP header
-        raise ValueError("short IP packet")
-    vihl = pkt[0]
-    ihl = (vihl & 0x0F) * 4
-    total_len = struct.unpack("!H", pkt[2:4])[0]
-    proto = pkt[9]
-    src_ip = socket.inet_ntoa(pkt[12:16])
-    dst_ip = socket.inet_ntoa(pkt[16:20])
-    return ihl, proto, src_ip, dst_ip, total_len
-
-def parse_icmp(pkt: bytes, ihl: int) -> Tuple[int, int, int, int, bytes]:
-    """Return (type, code, ident, seq, payload)."""
-    icmp_hdr = pkt[ihl:ihl+8]
-    if len(icmp_hdr) < 8:
-        raise ValueError("short ICMP header")
-    icmp_type, icmp_code, chk, ident, seq = struct.unpack("!BBHHH", icmp_hdr)
-    payload = pkt[ihl+8:]
-    return icmp_type, icmp_code, ident, seq, payload
-
-class ChatPeer:
-    def __init__(self, peer_ip: str, iface: Optional[str], verbose: bool):
-        self.peer_ip = peer_ip
-        self.peer_addr = None  # resolved IPv4 string
-        self.iface = iface
+# ---- peer ----
+class Peer:
+    def __init__(self, peer_ip: str, verbose: bool):
+        self.peer_ip = peer_ip               # literal IPv4 (10.0.0.10/11)
         self.verbose = verbose
-        self.raw_send = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        # Setting SO_BINDTODEVICE if iface provided (Linux only)
-        if self.iface and not WINDOWS:
-            try:
-                self.raw_send.setsockopt(socket.SOL_SOCKET, 25, self.iface.encode() + b"\x00")  # SO_BINDTODEVICE=25
-            except OSError:
-                pass  # non-Linux/Windows or lacks perms
-        # Receiver socket
-        self.raw_recv = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        # single raw ICMP socket for both send/recv (Linux)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        self.sock.settimeout(RECV_TIMEOUT)
+
         self.identifier = os.getpid() & 0xFFFF
         self.send_seq = 0
-        self.recv_seq_last = None
-        self.stop_event = threading.Event()
-        self.role = None  # 'master' or 'slave'
+        self.role: Optional[str] = None
         self.nonce = random.randint(0, 255)
-        self.peer_nonce = None
+        self.peer_nonce: Optional[int] = None
         self.handshaked = False
-        self.input_queue = []
+
+        self.input_queue: list[int] = []
         self.lock = threading.Lock()
+        self.stop = threading.Event()
 
     def log(self, *a):
-        if self.verbose:
-            print(*a, flush=True)
-
-    def resolve_peer(self, attempts: int = 120, delay: float = 0.5):
-        """Resolve peer name to IPv4 with retries (Docker DNS can be slow to register)."""
-        for i in range(attempts):
-            try:
-                self.peer_addr = socket.gethostbyname(self.peer_ip)
-                self.log(f"[dns] {self.peer_ip} -> {self.peer_addr}")
-                return True
-            except socket.gaierror:
-                if i == 0:
-                    print(f"[dns] waiting for {self.peer_ip} to resolve...", flush=True)
-                time.sleep(delay)
-        print(f"[dns] failed to resolve {self.peer_ip}", flush=True)
-        return False
+        if self.verbose: print(*a, flush=True)
 
     def next_seq(self) -> int:
-        val = self.send_seq
+        v = self.send_seq
         self.send_seq = (self.send_seq + 1) % MAX_SEQ
-        return val
+        return v
 
     def send_frame(self, ctrl: int, data_byte: int):
         seq = self.next_seq()
-        payload = build_payload(ctrl, seq, data_byte)
-        pkt = build_icmp_echo_reply(self.identifier, seq, payload)
+        pkt = build_icmp_echo_reply(self.identifier, seq, build_payload(ctrl, seq, data_byte))
         try:
-            if not self.peer_addr and not self.resolve_peer():
-                return
-            self.raw_send.sendto(pkt, (self.peer_addr, 0))
-        except socket.gaierror:
-            if self.resolve_peer():
-                try:
-                    self.raw_send.sendto(pkt, (self.peer_addr, 0))
-                except Exception as e:
-                    self.log(f"[send error after re-resolve] {e}")
-            else:
-                self.log("[send error] DNS not resolved")
-        except PermissionError:
-            print("[!] Need root privileges to send raw ICMP. Run with sudo.", file=sys.stderr)
-            os._exit(2)
+            self.sock.sendto(pkt, (self.peer_ip, 0))
         except Exception as e:
-            self.log(f"[send error] {e}")
+            self.log("[send error]", e)
 
-    def receiver_loop(self):
-        self.raw_recv.settimeout(RECV_TIMEOUT)
-        while not self.stop_event.is_set():
+    # ---- threads ----
+    def receiver(self):
+        while not self.stop.is_set():
             try:
-                pkt, addr = self.raw_recv.recvfrom(65535)
+                pkt, _ = self.sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except Exception as e:
-                self.log(f"[recv error] {e}")
-                continue
-            try:
-                if WINDOWS:
-                    src = addr[0]
-                    if len(pkt) < 8:
-                        continue
-                    icmp_type, icmp_code, ident, seq = struct.unpack('!BBHH', pkt[:6] + b'\x00\x00')[:4]
-                    # above trick to reuse format, but better to unpack directly:
-                    icmp_type, icmp_code, chk, ident, seq = struct.unpack('!BBHHH', pkt[:8])
-                    payload = pkt[8:]
-                else:
-                    ihl, proto, src, dst, tlen = parse_ip_header(pkt)
-                    if proto != socket.IPPROTO_ICMP:
-                        continue
-                    icmp_type, icmp_code, ident, seq, payload = parse_icmp(pkt, ihl)
-                # Only care Echo Reply (our channel) from the peer
-                peer_ok = (src == self.peer_ip) or (self.peer_addr is not None and src == self.peer_addr)
-                if icmp_type != ICMP_ECHO_REPLY or not peer_ok:
-                    continue
-                if len(payload) < 2:
-                    continue
-                ctrl, pseq, data = stego_unpack(payload[:2])
-            except Exception as e:
-                self.log(f"[parse error] {e}")
+                self.log("[recv error]", e); continue
+
+            # Assume standard IPv4 header without options in Docker => IHL=20
+            if len(pkt) < 28:  # 20 (IP) + 8 (ICMP)
                 continue
 
-            # Handshake / role negotiation
+            ihl = 20
+            icmp_hdr = pkt[ihl:ihl+8]
+            icmp_type, code, chk, ident, seq = struct.unpack("!BBHHH", icmp_hdr)
+            if icmp_type != ICMP_ECHO_REPLY:
+                continue
+            payload = pkt[ihl+8:]
+            if len(payload) < 2:
+                continue
+
+            # Optional: filter by source IP equals peer_ip
+            src_ip = socket.inet_ntoa(pkt[12:16])
+            if src_ip != self.peer_ip:
+                continue
+
+            ctrl, sseq, data = unpack_header(payload[:2])
+
+            # Handshake
             if not self.handshaked:
-                if ctrl == CTRL_START and data == MAGIC_BYTE:
-                    self.log(f"[handshake] peer START+MAGIC seen")
-                elif ctrl == CTRL_START and data != MAGIC_BYTE:
+                if ctrl == CTRL_START and data == MAGIC:
+                    self.log("[hs] peer MAGIC")
+                elif ctrl == CTRL_START:
                     self.peer_nonce = data
-                    if self.peer_nonce is not None:
-                        if self.nonce > self.peer_nonce:
-                            self.role = 'master'
-                        elif self.nonce < self.peer_nonce:
-                            self.role = 'slave'
-                        else:
-                            self.role = 'master' if self.identifier > ident else 'slave'
-                        self.handshaked = True
-                        self.log(f"[handshake] role={self.role}, my_nonce={self.nonce}, peer_nonce={self.peer_nonce}")
-                        print(f"[+] Negotiated role: {self.role}", flush=True)
-                        continue
-                continue  # wait until handshaked
+                    if self.nonce > self.peer_nonce:
+                        self.role = "master"
+                    elif self.nonce < self.peer_nonce:
+                        self.role = "slave"
+                    else:
+                        self.role = "master" if self.identifier > ident else "slave"
+                    self.handshaked = True
+                    print(f"[+] role: {self.role}", flush=True)
+                continue
 
-            # After handshake: data flow
+            # Data
             if ctrl == CTRL_MID:
-                # normal chat byte
-                sys.stdout.write(chr(data))
-                sys.stdout.flush()
+                sys.stdout.write(chr(data)); sys.stdout.flush()
             elif ctrl == CTRL_END:
-                print("\n[+] Peer ended the chat.", flush=True)
-                self.stop_event.set()
-                break
+                print("\n[+] peer ended.", flush=True)
+                self.stop.set(); break
 
-    def stdin_loop(self):
-        #\"\"\"Read from stdin and enqueue bytes to send as CTRL_MID.\"\"\"
-        # non-blocking read via select
-        while not self.stop_event.is_set():
-            r, _, _ = select.select([sys.stdin], [], [], 0.1)
+    def stdin_reader(self):
+        while not self.stop.is_set():
+            r,_,_ = select.select([sys.stdin], [], [], 0.1)
             if sys.stdin in r:
                 chunk = os.read(sys.stdin.fileno(), 1024)
                 if not chunk:
-                    # EOF
-                    self.stop_event.set()
-                    break
-                with self.lock:
-                    self.input_queue += list(chunk)
+                    self.stop.set(); break
+                with self.lock: self.input_queue += list(chunk)
             else:
                 time.sleep(0.05)
 
-    def sender_loop(self):
-        # Ensure peer is resolvable before we start sending
-        if not self.resolve_peer():
-            self.stop_event.set()
-            return
-        # 1) Handshake: broadcast START + MAGIC then START + nonce until role decided
-        t0 = time.time()
-        sent_magic = False
-        while not self.stop_event.is_set() and not self.handshaked:
+    def sender(self):
+        # Handshake phase
+        last = 0.0; sent_magic = False
+        while not self.stop.is_set() and not self.handshaked:
             now = time.time()
-            if (not sent_magic) or (now - t0) > HANDSHAKE_INTERVAL:
-                self.send_frame(CTRL_START, MAGIC_BYTE)
-                sent_magic = True
-                t0 = now
-                self.log("[handshake] sent START+MAGIC")
-                time.sleep(HANDSHAKE_INTERVAL/2)
-                self.send_frame(CTRL_START, self.nonce)
-                self.log(f"[handshake] sent START+NONCE={self.nonce}")
+            if (not sent_magic) or (now - last) > HANDSHAKE_INTERVAL:
+                self.send_frame(CTRL_START, MAGIC); sent_magic = True; last = now
+                time.sleep(HANDSHAKE_INTERVAL/2); self.send_frame(CTRL_START, self.nonce)
             time.sleep(0.1)
+        if not self.handshaked: return
 
-        if not self.handshaked:
-            # Someone pressed Ctrl+C early
-            return
-
-        # 2) Data phase: stream bytes from input_queue
-        while not self.stop_event.is_set():
+        # Data phase
+        while not self.stop.is_set():
             b = None
             with self.lock:
                 if self.input_queue:
                     b = self.input_queue.pop(0)
             if b is not None:
-                self.send_frame(CTRL_MID, b)
-                time.sleep(SEND_INTERVAL)
+                self.send_frame(CTRL_MID, b); time.sleep(SEND_INTERVAL)
             else:
                 time.sleep(0.02)
 
     def end(self):
-        try:
-            self.send_frame(CTRL_END, 0x00)
-        except Exception:
-            pass
+        try: self.send_frame(CTRL_END, 0)
+        except: pass
 
 def main():
-    ap = argparse.ArgumentParser(description="Covert ICMP chat (Type 0 Echo Reply) single-file with role negotiation.")
-    ap.add_argument("--peer", required=True, help="Peer IPv4 address")
-    ap.add_argument("--iface", default=None, help="Bind send socket to interface (Linux only, e.g., eth0)")
-    ap.add_argument("--verbose", action="store_true", help="Verbose logs")
+    ap = argparse.ArgumentParser(description="Covert ICMP chat (Type 0) — Docker/static IPs")
+    ap.add_argument("--peer", required=True, help="Peer IPv4 (e.g., 10.0.0.10/11)")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    peer = ChatPeer(args.peer, args.iface, args.verbose)
-    print("[*] Covert ICMP chat starting. Type your message and press Enter. Ctrl-D to end.", flush=True)
+    peer = Peer(args.peer, args.verbose)
+    print("[*] Covert ICMP chat. Type and press Enter. Ctrl-D to end.", flush=True)
 
-    recv_t = threading.Thread(target=peer.receiver_loop, daemon=True)
-    send_t = threading.Thread(target=peer.sender_loop, daemon=True)
-    stdin_t = threading.Thread(target=peer.stdin_loop, daemon=True)
-    recv_t.start()
-    send_t.start()
-    stdin_t.start()
+    th = [
+        threading.Thread(target=peer.receiver, daemon=True),
+        threading.Thread(target=peer.sender, daemon=True),
+        threading.Thread(target=peer.stdin_reader, daemon=True),
+    ]
+    [t.start() for t in th]
 
     try:
-        while recv_t.is_alive():
-            time.sleep(0.2)
+        while th[0].is_alive(): time.sleep(0.2)
     except KeyboardInterrupt:
         pass
     finally:
-        peer.stop_event.set()
-        peer.end()
-        time.sleep(0.1)
+        peer.stop.set(); peer.end(); time.sleep(0.1)
 
 if __name__ == "__main__":
     main()

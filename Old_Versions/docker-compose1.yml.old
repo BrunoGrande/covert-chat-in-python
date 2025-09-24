@@ -4,13 +4,13 @@ services:
     image: icmp_covert_chat:peera
     container_name: icmp_peera
     cap_add: [NET_RAW]
-    stdin_open: true
-    tty: true
+    stdin_open: true   # like: -i
+    tty: true          # like: -t
     restart: unless-stopped
-    command: ["--peer", "10.0.0.11", "--verbose"]
+    command: ["--peer", "peerb", "--verbose"]
     networks:
       covert_net:
-        ipv4_address: 10.0.0.10
+        aliases: [peera]
     volumes:
       - ./captures:/captures
     user: "0:0"
@@ -23,10 +23,10 @@ services:
     stdin_open: true
     tty: true
     restart: unless-stopped
-    command: ["--peer", "10.0.0.10", "--verbose"]
+    command: ["--peer", "peera", "--verbose"]
     networks:
       covert_net:
-        ipv4_address: 10.0.0.11
+        aliases: [peerb]
     volumes:
       - ./captures:/captures
     user: "0:0"
@@ -34,6 +34,3 @@ services:
 networks:
   covert_net:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 10.0.0.0/24
